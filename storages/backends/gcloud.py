@@ -1,4 +1,5 @@
 import mimetypes
+from gzip import GzipFile
 from tempfile import SpooledTemporaryFile
 
 from django.core.exceptions import ImproperlyConfigured, SuspiciousOperation
@@ -7,6 +8,7 @@ from django.core.files.storage import Storage
 from django.utils import timezone
 from django.utils.deconstruct import deconstructible
 from django.utils.encoding import force_bytes, smart_str
+from django.utils.six import BytesIO
 
 from storages.utils import clean_name, safe_join, setting
 
@@ -17,6 +19,12 @@ try:
 except ImportError:
     raise ImproperlyConfigured("Could not load Google Cloud Storage bindings.\n"
                                "See https://github.com/GoogleCloudPlatform/gcloud-python")
+
+try:
+    from boto.gs.key import Key as GSKey
+except ImportError:
+    raise ImproperlyConfigured("Could not load Boto's Google Storage bindings.\n"
+                               "See https://github.com/boto/boto")
 
 
 class GoogleCloudFile(File):
@@ -46,6 +54,8 @@ class GoogleCloudFile(File):
                 self._is_dirty = False
                 self.blob.download_to_file(self._file)
                 self._file.seek(0)
+            if self._storage.gzip and self.blob.content_encoding == 'gzip':
+                self._file = GzipFile(mode=self._mode, fileobj=self._file)
         return self._file
 
     def _set_file(self, value):
@@ -83,13 +93,25 @@ class GoogleCloudStorage(Storage):
     credentials = setting('GS_CREDENTIALS', None)
     bucket_name = setting('GS_BUCKET_NAME', None)
     location = setting('GS_LOCATION', '')
+    key_class = GSKey
+
     auto_create_bucket = setting('GS_AUTO_CREATE_BUCKET', False)
     auto_create_acl = setting('GS_AUTO_CREATE_ACL', 'projectPrivate')
     file_name_charset = setting('GS_FILE_NAME_CHARSET', 'utf-8')
     file_overwrite = setting('GS_FILE_OVERWRITE', True)
     # The max amount of memory a returned file can take up before being
     # rolled over into a temporary file on disk. Default is 0: Do not roll over.
+    # headers = setting('GS_HEADERS', {})
     max_memory_size = setting('GS_MAX_MEMORY_SIZE', 0)
+
+    gzip = setting('GS_IS_GZIPPED', False)
+    gzip_content_types = setting('GS_GZIP_CONTENT_TYPES', (
+        'text/css',
+        'text/javascript',
+        'application/javascript',
+        'application/x-javascript',
+        'image/svg+xml',
+    ))
 
     def __init__(self, **settings):
         # check if some of the settings we've provided as class attributes
@@ -160,9 +182,26 @@ class GoogleCloudStorage(Storage):
         cleaned_name = clean_name(name)
         name = self._normalize_name(cleaned_name)
 
+        _type, encoding = mimetypes.guess_type(name)
+        content_type = getattr(content, 'content_type', None)
+        content_type = content_type or _type or self.key_class.DefaultContentType
+
+        # setting the content_type in the key object is not enough.
+        # headers.update({'Content-Type': content_type})
+        content_encoding = None
+        if self.gzip and content_type in self.gzip_content_types:
+            content = self._compress_content(content)
+            content_encoding = 'gzip'
+        elif encoding:
+            # If the content already has a particular encoding, set it
+            content_encoding = encoding
+
         content.name = cleaned_name
         encoded_name = self._encode_name(name)
+
         file = GoogleCloudFile(encoded_name, 'rw', self)
+        if content_encoding:
+            file.blob.content_encoding = content_encoding
         file.blob.upload_from_file(content, size=content.size,
                                    content_type=file.mime_type)
         return cleaned_name
@@ -251,3 +290,20 @@ class GoogleCloudStorage(Storage):
             name = clean_name(name)
             return name
         return super(GoogleCloudStorage, self).get_available_name(name, max_length)
+
+    def _compress_content(self, content):
+        """Gzip a given string content."""
+        zbuf = BytesIO()
+        #  The GZIP header has a modification time attribute (see http://www.zlib.org/rfc-gzip.html)
+        #  This means each time a file is compressed it changes even if the other contents don't change
+        #  For S3 this defeats detection of changes using MD5 sums on gzipped files
+        #  Fixing the mtime at 0.0 at compression time avoids this problem
+        zfile = GzipFile(mode='wb', compresslevel=6, fileobj=zbuf, mtime=0.0)
+        try:
+            zfile.write(force_bytes(content.read()))
+        finally:
+            zfile.close()
+        zbuf.seek(0)
+        content.file = zbuf
+        content.seek(0)
+        return content
